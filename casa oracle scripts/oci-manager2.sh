@@ -1,162 +1,183 @@
-#!/usr/bin/env bash
+#!/bin/bash
 #
-# oci-manager2.sh
-# Enhanced OCI Security List & iptables sync for CasaOS + Docker ports
-#
-set -euo pipefail
+# oci-manager2.sh — Improved OCI Security List & iptables Sync for CasaOS & Docker
+# Logs to /DATA/Documents/oci-manager2-<timestamp>.log
+# Place in /usr/local/bin and chmod +x
 
+set -euo pipefail
+IFS=$'\n\t'
+
+# Configuration
 LOG_DIR="/DATA/Documents"
 mkdir -p "$LOG_DIR"
-TIMESTAMP=$(date +%Y%m%d-%H%M%S)
-LOG_FILE="$LOG_DIR/oci-manager2-$TIMESTAMP.log"
-CHAIN="CASAOS-OCI-PORTS"
-OCI_CLI="${OCI_CLI:-oci}"
-OCI_DEBUG_FLAGS="--debug"
+LOG_FILE="$LOG_DIR/oci-manager2-$(date +%Y%m%d-%H%M%S).log"
+OCI_CLI_DEBUG="${OCI_CLI_DEBUG:-0}"
+DEFAULT_SL_OCID="ocid1.securitylist.oc1.il-jerusalem-1.aaaaaaaalbopisjjx3i3z2pediruuus2pxyk4sfhjd4j7pqw4fpn7ugmym2q"
+IPTABLES_CHAIN="CASAOS-OCI-PORTS"
+AUTO_TIMER="oci-port-sync.timer"
+AUTO_SERVICE="oci-port-sync.service"
 
-# Helper: log with timestamp
-log() { echo "[$(date +'%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
+# Helpers
+_log() { echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"; }
+info() { _log "INFO: $*"; echo -e "ℹ $*"; }
+success() { _log "OK: $*"; echo -e "✓ $*"; }
+error() { _log "ERROR: $*"; echo -e "✗ $*" >&2; }
+run() {
+  _log "COMMAND: $*"
+  if ! output=$("$@" 2>&1); then
+    error "Command failed: $*"
+    _log "OUTPUT: $output"
+    return 1
+  fi
+  _log "OUTPUT: $output"
+  echo "$output"
+}
 
 # Ensure OCI CLI installed
-ensure_oci_cli() {
-  if ! command -v $OCI_CLI &>/dev/null; then
-    log "INFO: Installing OCI CLI..."
+ensure_oci() {
+  if ! command -v oci &>/dev/null; then
+    info "Installing OCI CLI"
     apt-get update -qq
-    apt-get install -y python3-pip jq &>>"$LOG_FILE"
-    pip3 install oci-cli &>>"$LOG_FILE"
-    log "INFO: OCI CLI installed"
+    apt-get install -y python3-pip > /dev/null
+    pip3 install oci-cli > /dev/null
+    success "OCI CLI installed"
   fi
 }
 
-# Validate OCI config & auth
+# Validate OCI auth
 validate_oci() {
-  log "INFO: Validating OCI CLI authentication..."
-  if ! $OCI_CLI iam region list $OCI_DEBUG_FLAGS &>>"$LOG_FILE"; then
-    log "ERROR: OCI CLI authentication failed"; exit 1
+  info "Validating OCI CLI authentication"
+  if ! run oci iam region list &>/dev/null; then
+    error "OCI auth failed—please run 'oci setup config' or check ~/.oci/config"
+    exit 1
   fi
-  log "INFO: OCI CLI authenticated"
+  success "OCI CLI authenticated"
 }
 
-# Read security-list OCID
-choose_security_list() {
-  echo
-  log "INFO: Security List Management"
-  echo "1) Use default security list OCID (from instance metadata)"
-  echo "2) Enter custom security list OCID"
-  echo "3) Skip OCI sync"
-  read -rp "Choose option [1-3]: " opt
-  case $opt in
-    1)
-      DEFAULT_SL=$($OCI_CLI compute instance list --availability-domain "$(curl -s http://169.254.169.254/opc/v2/instance/ | jq -r .data.\"availability-domain\")" \
-        --query 'data[0].metadata."securityListIds"[0]' --raw-output)
-      SL_OCID=${SL_OCID:-$DEFAULT_SL}
-      ;;
-    2)
-      read -rp "Enter Security List OCID: " SL_OCID
-      ;;
-    3)
-      log "INFO: Skipping OCI sync per user choice"
-      SKIP_OCI=true
-      ;;
-    *)
-      log "ERROR: Invalid option"; exit 1
-      ;;
-  esac
-  log "INFO: Using Security List: $SL_OCID"
-}
-
-# Gather ports & protocols (ingress)
+# Build list of published ports and protocols
 gather_ports() {
-  log "INFO: Gathering CasaOS Gateway ports..."
-  ports=$(curl -s http://127.0.0.1:$(grep -Po '(?<=management.url ).*' /var/run/casaos/management.url | cut -d: -f2)/v1/gateway/routes \
-           | jq -r '.routes[] | "\(.port)/\(.protocol|ascii_upcase)"')
-  log "INFO: Gathering Docker published ports..."
-  docker_ports=$(docker ps --format '{{.Ports}}' | grep -oP '(?<=0\.0\.0\.0:)\d+/(tcp|udp)' || true)
-  all_ports=$(printf "%s\n%s\nTCP/Ingress\nUDP/Ingress\n" "$ports" "$docker_ports" | sort -u)
-  echo "$all_ports"
-}
-
-# Setup iptables chain
-setup_iptables_chain() {
-  if ! iptables -nL "$CHAIN" &>/dev/null; then
-    iptables -N "$CHAIN"
-    iptables -I INPUT -m conntrack --ctstate NEW -j "$CHAIN"
-    log "INFO: Created iptables chain $CHAIN"
+  info "Gathering CasaOS & Docker ports"
+  declare -A map
+  # CasaOS Gateway
+  if [[ -f /var/run/casaos/management.url ]]; then
+    mgmt_port=$(grep -Po '(?<=:)\d+' /var/run/casaos/management.url)
+    for p in $(curl -s "http://127.0.0.1:$mgmt_port/v1/gateway/routes" | jq -r '.routes[] | "\(.port)/\(.protocol)"'); do
+      map["$p"]=1
+    done
   fi
-  iptables -F "$CHAIN"
+  # Docker published
+  for line in $(docker ps --format '{{.Ports}}'); do
+    # e.g. "0.0.0.0:8000->80/tcp"
+    while [[ $line =~ ([0-9\.]+):([0-9]+)->([0-9]+)/([a-z]+) ]]; do
+      publ="${BASH_REMATCH[2]}/${BASH_REMATCH[4]}"
+      map["$publ"]=1
+      line=${line#*${BASH_REMATCH[0]}}
+    done
+  done
+  # Always include SSH/web
+  map["22/tcp"]=1 map["80/tcp"]=1 map["443/tcp"]=1
+  # Export arrays
+  PORTS=()
+  for k in "${!map[@]}"; do PORTS+=("$k"); done
 }
 
-# Apply iptables rules
-apply_iptables() {
-  setup_iptables_chain
-  while read -r entry; do
-    [[ -z $entry ]] && continue
-    port=${entry%/*}; proto=${entry#*/}
-    iptables -A "$CHAIN" -p "${proto,,}" --dport "$port" -j ACCEPT
-    log "INFO: iptables allow $proto port $port"
-  done <<<"$1"
-  netfilter-persistent save &>>"$LOG_FILE"
-}
-
-# Build OCI JSON rules
-build_oci_json() {
-  ports_json="["
-  first=true
-  while read -r entry; do
-    [[ -z $entry ]] && continue
+# Generate JSON rules for both ingress and egress (mirrored)
+gen_rules_json() {
+  info "Generating OCI security-list rules JSON"
+  ingress=()
+  egress=()
+  for entry in "${PORTS[@]}"; do
     port=${entry%/*}
     proto=${entry#*/}
-    [[ $first == true ]] && first=false || ports_json+=","
-    ports_json+=$(
-      jq -n --arg p "$port" --arg pro "$([[ $proto == TCP ]] && echo 6 || echo 17)" \
-        '{ source:"0.0.0.0/0", protocol:$pro, isStateless:false,
-           tcpOptions:(if $pro=="6" then { destinationPortRange:{min:($p|tonumber),max:($p|tonumber)} } else null end),
-           udpOptions:(if $pro=="17" then { destinationPortRange:{min:($p|tonumber),max:($p|tonumber)} } else null end)
-        }'
-    )
-  done <<<"$1"
-  ports_json+="]"
-  echo "$ports_json"
+    numproto=$([[ "$proto" == "tcp" ]] && echo 6 || echo 17)
+    rule=$(cat <<EOF
+{
+  "source": "0.0.0.0/0",
+  "protocol": "$numproto",
+  "isStateless": false,
+  "${proto}Options": {
+    "destinationPortRange": { "min": $port, "max": $port }
+  }
+}
+EOF
+)
+    ingress+=("$rule")
+    # egress allow same port outbound
+    ruleOut=$(cat <<EOF
+{
+  "destination": "0.0.0.0/0",
+  "protocol": "$numproto",
+  "isStateless": false,
+  "${proto}Options": {
+    "destinationPortRange": { "min": $port, "max": $port }
+  }
+}
+EOF
+)
+    egress+=("$ruleOut")
+  done
+  # join
+  ingress_json="[${ingress[*]}]"
+  egress_json="[${egress[*]}]"
+  _log "Ingress JSON: $ingress_json"
+  _log "Egress  JSON: $egress_json"
 }
 
-# Sync to OCI
-sync_to_oci() {
-  if [[ "${SKIP_OCI:-false}" == true ]]; then return; fi
-  log "INFO: Fetching existing security list..."
-  existing=$($OCI_CLI network security-list get --security-list-id "$SL_OCID" $OCI_DEBUG_FLAGS &>>"$LOG_FILE")
-  rules_json=$(build_oci_json "$1")
-  tmp=$(mktemp)
-  echo "$rules_json" >"$tmp"
-  log "INFO: Updating OCI Security List ($SL_OCID)..."
-  if ! $OCI_CLI network security-list update \
-        --security-list-id "$SL_OCID" \
-        --ingress-security-rules file://"$tmp" \
-        --egress-security-rules '[]' \
-        --force $OCI_DEBUG_FLAGS &>>"$LOG_FILE"; then
-    log "ERROR: OCI update failed; see log for details"; exit 1
+# Update OCI security list
+sync_oci() {
+  local sl_ocid=$1
+  gen_rules_json
+  info "Updating OCI security list: $sl_ocid"
+  tmpf=$(mktemp)
+  cat >"$tmpf" <<EOF
+{
+  "ingressSecurityRules": $ingress_json,
+  "egressSecurityRules": $egress_json
+}
+EOF
+  run oci network security-list update \
+    --security-list-id "$sl_ocid" \
+    --force \
+    --from-json file://"$tmpf"
+  rm -f "$tmpf"
+  success "OCI security list updated"
+}
+
+# Update iptables
+sync_iptables() {
+  info "Syncing iptables chain: $IPTABLES_CHAIN"
+  iptables -nL "$IPTABLES_CHAIN" &>/dev/null || iptables -N "$IPTABLES_CHAIN"
+  # hook chain
+  if ! iptables -C INPUT -j "$IPTABLES_CHAIN" &>/dev/null; then
+    pos=$(iptables -L INPUT --line-numbers | grep REJECT | head -1 | awk '{print $1}')
+    iptables -I INPUT "$pos" -j "$IPTABLES_CHAIN"
   fi
-  rm -f "$tmp"
-  log "INFO: OCI Security List updated"
+  iptables -F "$IPTABLES_CHAIN"
+  for entry in "${PORTS[@]}"; do
+    port=${entry%/*}
+    proto=${entry#*/}
+    iptables -A "$IPTABLES_CHAIN" -p "$proto" --dport "$port" -j ACCEPT
+  done
+  iptables -A "$IPTABLES_CHAIN" -j RETURN
+  netfilter-persistent save
+  success "iptables updated"
 }
 
-# Install systemd service & timer
-install_service() {
-  cat >/etc/systemd/system/oci-manager2.service <<EOF
+# Setup systemd timer & service
+setup_auto_sync() {
+  info "Creating systemd service & timer for automatic sync"
+  cat >/etc/systemd/system/oci-port-sync.service <<EOF
 [Unit]
-Description=OCI Security List Sync for CasaOS Ports
-After=network-online.target
-Wants=network-online.target
+Description=OCI & iptables port-sync for CasaOS
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/oci-manager2.sh --sync
-
-[Install]
-WantedBy=multi-user.target
+ExecStart=/usr/local/bin/oci-manager2.sh --sync-only \$SL_OCID
 EOF
 
-  cat >/etc/systemd/system/oci-manager2.timer <<EOF
+  cat >/etc/systemd/system/oci-port-sync.timer <<EOF
 [Unit]
-Description=Timer for OCI Security List Sync
+Description=Run OCI port-sync every 10 minutes
 
 [Timer]
 OnCalendar=*:0/10
@@ -167,48 +188,57 @@ WantedBy=timers.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable --now oci-manager2.timer
-  log "INFO: Installed systemd timer for automatic sync every 10 minutes"
+  systemctl enable --now oci-port-sync.timer
+  success "Automatic sync enabled (every 10m)"
 }
 
-# Main interactive flow
+# Interactive menu
 main() {
-  ensure_oci_cli
+  ensure_oci
   validate_oci
-  choose_security_list
+  gather_ports
 
-  echo; log "INFO: Getting current port/protocol list..."
-  entries=$(gather_ports)
-  echo "$entries" | tee -a "$LOG_FILE"
-
-  apply_iptables "$entries"
-  sync_to_oci "$entries"
-
-  echo
-  echo "1) Sync now"
-  echo "2) Install auto-sync timer (every 10 min)"
-  echo "3) Both"
-  read -rp "Choose option [1-3]: " choice
-  case $choice in
-    1) ;;
-    2) install_service ;;
-    3) install_service ;;
-    *) log "ERROR: Invalid choice"; exit 1 ;;
+  echo; info "=== OCI Security List Manager ==="
+  echo "1) Use default security list"
+  echo "2) Enter custom security list OCID"
+  echo "3) Skip OCI setup"
+  read -rp "Choose [1-3]: " opt
+  case $opt in
+    1) SL_OCID=$DEFAULT_SL_OCID ;;
+    2) read -rp "Enter Security List OCID: " SL_OCID ;;
+    3) SL_OCID="" ;;
+    *) error "Invalid"; exit 1 ;;
   esac
 
-  log "INFO: oci-manager2 completed successfully"
+  echo; echo "Detected ports/protocols:"
+  printf "  %s\n" "${PORTS[@]}"
+
+  echo; echo "1) Sync now"
+  echo "2) Enable automatic sync"
+  echo "3) Both"
+  read -rp "Choose [1-3]: " action
+
+  [[ -n $SL_OCID ]] && {
+    (( action==1 || action==3 )) && sync_oci "$SL_OCID"
+  }
+
+  sync_iptables
+
+  (( action==2 || action==3 )) && {
+    setup_auto_sync
+  }
+
+  success "All done! Logs: $LOG_FILE"
 }
 
-# CLI switches
-case "${1:-}" in
-  --interactive) main ;;
-  --sync)
-    entries=$(gather_ports)
-    apply_iptables "$entries"
-    sync_to_oci "$entries"
-    ;;
-  *)
-    echo "Usage: $0 --interactive | --sync"
-    exit 1
-    ;;
-esac
+if [[ "${1:-}" == "--interactive" ]]; then
+  main
+elif [[ "${1:-}" == "--sync-only" ]]; then
+  SL_OCID=$2
+  gather_ports
+  sync_oci "$SL_OCID"
+  sync_iptables
+else
+  echo "Usage: $0 --interactive"
+  exit 1
+fi
